@@ -1,0 +1,51 @@
+name: Hidden Sunflowers Place Resolver
+
+on:
+  push:
+    branches: [ctf-hidden-sunflowers]
+  workflow_dispatch:
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve public Google Maps POI
+        run: |
+          python - <<'PY'
+          import re, requests, urllib.parse
+          place='ChIJt_HhcwDfXzQR6yfgScjlGbQ'
+          urls=[
+            'https://www.google.com/maps/place/?q=place_id:'+place,
+            'https://www.google.com/maps/search/?api=1&query='+urllib.parse.quote('ひまわり畑 石垣')+'&query_place_id='+place,
+            'https://maps.google.com/maps?q=place_id:'+place,
+          ]
+          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          out=[]
+          for u in urls:
+            r=s.get(u,timeout=30,allow_redirects=True)
+            txt=r.text
+            out += [f'URL {r.status_code} final={r.url} bytes={len(txt)}']
+            pats=[r'@(-?\d{2}\.\d+),(-?\d{3}\.\d+)',r'!3d(-?\d{2}\.\d+)!4d(-?\d{3}\.\d+)',r'(-?24\.\d{5,}),(-?124\.\d{5,})']
+            seen=[]
+            for p in pats:
+              for m in re.finditer(p,txt):
+                v=(m.group(1),m.group(2))
+                if v not in seen: seen.append(v)
+            out += ['COORDS '+repr(seen[:100])]
+            open('google_place.html','w',encoding='utf8').write(txt)
+          # Also query Nominatim by exact address for an independent sanity check.
+          q='Japan, 〒907-0024 Okinawa, Ishigaki, Arakawa, 1695-58'
+          r=s.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':10},headers={'User-Agent':'HiddenSunflowersCTF/1.0'},timeout=30)
+          out += ['NOMINATIM '+r.text]
+          open('place-results.txt','w',encoding='utf8').write('\n'.join(out))
+          print('\n'.join(out))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hidden-sunflowers-place
+          path: |
+            place-results.txt
+            google_place.html
+          retention-days: 1
