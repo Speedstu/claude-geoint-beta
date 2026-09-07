@@ -1,0 +1,112 @@
+name: Hidden Sunflowers GEOINT v2
+
+on:
+  push:
+    branches: [ctf-hidden-sunflowers]
+  workflow_dispatch:
+
+jobs:
+  refine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests pillow beautifulsoup4
+      - name: Passive page extraction and Google tile mosaics
+        run: |
+          cat > /tmp/refine.py <<'PY'
+          import io, json, math, re, time
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageDraw, ImageFont
+
+          OUT=Path('sunflower-v2'); OUT.mkdir(exist_ok=True)
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36'})
+          lines=[]
+
+          urls=[
+            'https://churamichi.com/articles/sun-flower.html',
+            'https://ameblo.jp/goodday0725/entry-12900892193.html',
+            'https://ameblo.jp/goodday0725/entry-12804559883.html',
+            'https://www.jalan.net/yad357658/blog/entry0006685126.html',
+          ]
+          pats=[
+            r'@(-?\d{2}\.\d{4,}),(-?\d{3}\.\d{4,})',
+            r'center=(-?\d{2}\.\d{4,})%2C(-?\d{3}\.\d{4,})',
+            r'center=(-?\d{2}\.\d{4,}),(-?\d{3}\.\d{4,})',
+            r'!3d(-?\d{2}\.\d{4,})!4d(-?\d{3}\.\d{4,})',
+            r'"latitude"\s*:\s*(-?\d{2}\.\d+).*?"longitude"\s*:\s*(-?\d{3}\.\d+)',
+            r'"lat"\s*:\s*(-?\d{2}\.\d+).*?"lng"\s*:\s*(-?\d{3}\.\d+)',
+          ]
+          for u in urls:
+            try:
+              r=S.get(u,timeout=30); lines.append(f'PAGE {r.status_code} {u} bytes={len(r.content)}')
+              txt=r.text
+              (OUT/(re.sub(r'[^A-Za-z0-9]+','_',u)[-90:]+'.html')).write_text(txt,encoding='utf-8')
+              soup=BeautifulSoup(txt,'html.parser')
+              for tag in soup.find_all(['iframe','a']):
+                z=tag.get('src') or tag.get('href') or ''
+                if 'map' in z.lower() or 'google' in z.lower(): lines.append(' MAPURL '+z[:1000])
+              seen=[]
+              for pat in pats:
+                for m in re.finditer(pat,txt,re.S):
+                  p=(m.group(1),m.group(2))
+                  if p not in seen: seen.append(p)
+              lines.append(' COORDS '+repr(seen[:100]))
+            except Exception as e: lines.append(' PAGEERR '+u+' '+repr(e))
+
+          # exact anchor search via OSM Overpass (passive public API)
+          q='''[out:json][timeout:60];(nwr["name"~"あやぱに|Ayapani|ミルミル|Mirumiru"](24.34,124.10,24.39,124.17););out center tags;'''
+          try:
+            r=S.post('https://overpass-api.de/api/interpreter',data={'data':q},timeout=90); lines.append('OVERPASS '+str(r.status_code))
+            data=r.json()
+            for e in data.get('elements',[]):
+              c=e.get('center',{}); lat=e.get('lat',c.get('lat')); lon=e.get('lon',c.get('lon')); t=e.get('tags',{})
+              lines.append(f' ANCHOR {lat},{lon} name={t.get("name")} type={e.get("type")} id={e.get("id")} tags={json.dumps(t,ensure_ascii=False)}')
+          except Exception as e: lines.append('OVERPASSERR '+repr(e))
+
+          z=18
+          west,south,east,north=124.105,24.352,124.148,24.385
+          n=1<<z
+          def lon2x(lon): return int((lon+180)/360*n)
+          def lat2y(lat):
+            rad=math.radians(lat); return int((1-math.asinh(math.tan(rad))/math.pi)/2*n)
+          def tile2lon(x): return x/n*360-180
+          def tile2lat(y): return math.degrees(math.atan(math.sinh(math.pi*(1-2*y/n))))
+          x0,x1=lon2x(west),lon2x(east); y0,y1=lat2y(north),lat2y(south)
+          lines.append(f'GRID z={z} x={x0}..{x1} y={y0}..{y1} count={(x1-x0+1)*(y1-y0+1)} actual_bbox={tile2lon(x0)},{tile2lat(y1+1)},{tile2lon(x1+1)},{tile2lat(y0)}')
+
+          for layer,label in [('s','satellite'),('y','hybrid')]:
+            W=(x1-x0+1)*256; H=(y1-y0+1)*256
+            mos=Image.new('RGB',(W,H),(230,230,230)); ok=0
+            for yy in range(y0,y1+1):
+              for xx in range(x0,x1+1):
+                u=f'https://mt1.google.com/vt/lyrs={layer}&x={xx}&y={yy}&z={z}'
+                try:
+                  rr=S.get(u,timeout=20)
+                  if rr.status_code==200:
+                    im=Image.open(io.BytesIO(rr.content)).convert('RGB'); mos.paste(im,((xx-x0)*256,(yy-y0)*256)); ok+=1
+                except Exception: pass
+            # grid every 4 tiles with coordinate labels
+            d=ImageDraw.Draw(mos)
+            for xx in range(x0,x1+1,4):
+              px=(xx-x0)*256
+              d.line([(px,0),(px,H)],fill='white',width=2)
+              d.text((px+6,6),f'lon {tile2lon(xx):.5f}',fill='white',stroke_width=2,stroke_fill='black')
+            for yy in range(y0,y1+1,4):
+              py=(yy-y0)*256
+              d.line([(0,py),(W,py)],fill='white',width=2)
+              d.text((6,py+6),f'lat {tile2lat(yy):.5f}',fill='white',stroke_width=2,stroke_fill='black')
+            mos.save(OUT/f'google_{label}_z18.jpg',quality=91)
+            lines.append(f'{label.upper()} tiles_ok={ok}')
+
+          (OUT/'results.txt').write_text('\n'.join(lines),encoding='utf-8')
+          print('\n'.join(lines))
+          PY
+          python /tmp/refine.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hidden-sunflowers-v2
+          path: sunflower-v2/
+          retention-days: 3
