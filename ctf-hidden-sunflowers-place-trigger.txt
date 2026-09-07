@@ -1,0 +1,1 @@
+Resolve Google Maps sunflower POI coordinates.
