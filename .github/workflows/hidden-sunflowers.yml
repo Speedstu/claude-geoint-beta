@@ -1,0 +1,105 @@
+name: Hidden Sunflowers GEOINT
+
+on:
+  push:
+    branches: [ctf-hidden-sunflowers]
+  workflow_dispatch:
+
+jobs:
+  geoint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python deps
+        run: pip install requests pillow
+      - name: Query OSM and build satellite mosaic
+        run: |
+          cat > /tmp/analyze.py <<'PY'
+          import math, re, json, time
+          from pathlib import Path
+          import requests
+          from PIL import Image
+
+          OUT=Path('sunflower-output'); OUT.mkdir(exist_ok=True)
+          UA={'User-Agent':'HiddenSunflowers-CTF-passive-osint/1.0'}
+
+          def get(url, **kw):
+              r=requests.get(url,headers=UA,timeout=30,**kw); print('GET',r.status_code,url[:180]); r.raise_for_status(); return r
+
+          lines=[]
+          # Geocode known anchors.
+          for q in ['Mirumiru Honpo Main Store, Ishigaki, Okinawa, Japan', '石垣島ミルミル本舗 本店', '石垣あやぱにボウル', '児童養護施設ならさ 石垣']:
+              try:
+                  r=get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':5})
+                  rows=r.json(); lines.append('\nNOMINATIM '+q)
+                  for x in rows: lines.append(json.dumps({k:x.get(k) for k in ['display_name','lat','lon','type','osm_type','osm_id']},ensure_ascii=False))
+              except Exception as e: lines.append('ERR '+q+' '+repr(e))
+              time.sleep(1.1)
+
+          # Broad Overpass dump of named map features around Narasa/Shinkawa.
+          query='''[out:json][timeout:60];(nwr["name"](24.345,124.095,24.395,124.145););out center tags;'''
+          try:
+              r=requests.post('https://overpass-api.de/api/interpreter',data={'data':query},headers=UA,timeout=90)
+              print('OVERPASS',r.status_code); r.raise_for_status(); data=r.json();
+              feats=[]
+              for e in data.get('elements',[]):
+                  t=e.get('tags',{}); c=e.get('center',{})
+                  lat=e.get('lat',c.get('lat')); lon=e.get('lon',c.get('lon'))
+                  if lat is None or lon is None: continue
+                  feats.append((float(lat),float(lon),t.get('name'),t.get('name:en'),t.get('tourism'),t.get('amenity'),t.get('shop'),t.get('historic'),t.get('natural'),e.get('type'),e.get('id')))
+              # sort by distance to 1 km west of Mirumiru approximate anchor
+              a=(24.37105,124.1128)
+              def dist(f):
+                  lat,lon=f[0],f[1]; return math.hypot((lat-a[0])*111.1,(lon-a[1])*101.5)
+              feats.sort(key=dist)
+              lines.append('\nOVERPASS NAMED FEATURES sorted from approx 1km west of Mirumiru:')
+              for f in feats[:250]: lines.append(f'{dist(f):7.3f} km | {f[0]:.7f},{f[1]:.7f} | {f[2:]}')
+          except Exception as e: lines.append('OVERPASS ERR '+repr(e))
+
+          # Try public Google Maps search pages; extract coordinate pairs embedded in HTML.
+          for q in ['新川奈良佐 ひまわり畑 石垣島','石垣島 ひまわり畑 ミルミル本舗','Narasa sunflower field Ishigaki']:
+              try:
+                  r=get('https://www.google.com/maps/search/'+requests.utils.quote(q),allow_redirects=True)
+                  txt=r.text
+                  pairs=[]
+                  for m in re.finditer(r'(-?2[34]\.\d{4,}),(-?12[34]\.\d{4,})',txt):
+                      p=(m.group(1),m.group(2))
+                      if p not in pairs: pairs.append(p)
+                  lines.append('\nGMAPS '+q+' final='+r.url)
+                  lines.append('coords: '+repr(pairs[:80]))
+              except Exception as e: lines.append('GMAPS ERR '+q+' '+repr(e))
+
+          # Esri imagery mosaic, west of Mirumiru where 2026 local sources place the field.
+          z=18
+          west,south,east,north=124.102,24.360,124.126,24.383
+          def lon2x(lon): return int((lon+180.0)/360.0*(1<<z))
+          def lat2y(lat):
+              rad=math.radians(lat)
+              return int((1.0-math.asinh(math.tan(rad))/math.pi)/2.0*(1<<z))
+          x0,x1=lon2x(west),lon2x(east)
+          y0,y1=lat2y(north),lat2y(south)
+          print('tiles',x0,x1,y0,y1,(x1-x0+1)*(y1-y0+1))
+          mos=Image.new('RGB',((x1-x0+1)*256,(y1-y0+1)*256))
+          ok=0
+          for y in range(y0,y1+1):
+              for x in range(x0,x1+1):
+                  url=f'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+                  try:
+                      b=get(url).content
+                      import io
+                      im=Image.open(io.BytesIO(b)).convert('RGB')
+                      mos.paste(im,((x-x0)*256,(y-y0)*256)); ok+=1
+                  except Exception as e: print('tile err',x,y,e)
+          mos.save(OUT/'esri_z18_west_mirumiru.jpg',quality=94)
+          lines.append(f'\nMOSAIC bbox west={west},south={south},east={east},north={north}, z={z}, tiles={ok}')
+          lines.append(f'tile grid x={x0}..{x1}, y={y0}..{y1}')
+          (OUT/'results.txt').write_text('\n'.join(lines),encoding='utf-8')
+          print('\n'.join(lines))
+          PY
+          python /tmp/analyze.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hidden-sunflowers-geoint
+          path: sunflower-output/
+          retention-days: 3
