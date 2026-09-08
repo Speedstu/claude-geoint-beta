@@ -15,7 +15,9 @@ async function callClaude(messages, system, maxTokens = 1500) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90000);
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    // Route through same-origin backend proxy so the Anthropic API key stays
+    // server-side and is never exposed to the browser/bundle.
+    const r = await fetch("/api/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -216,7 +218,10 @@ ${reasoning}
   done4();
 
   const tag = (src, name) => {
-    const m = src.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`));
+    const openTag = `<${name}>`, closeTag = `</${name}>`;
+    const openIdx = src.indexOf(openTag);
+    const closeIdx = openIdx === -1 ? -1 : src.indexOf(closeTag, openIdx + openTag.length);
+    const m = openIdx !== -1 && closeIdx !== -1 ? [null, src.slice(openIdx + openTag.length, closeIdx)] : null;
     return m ? m[1].trim() : "";
   };
   const num = (src, name) => { const v = parseFloat(tag(src, name)); return isNaN(v) ? null : v; };
